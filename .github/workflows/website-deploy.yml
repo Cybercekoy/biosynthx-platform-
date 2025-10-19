@@ -1,0 +1,12 @@
+name: Website Deploy
+on:
+  push:
+    paths: ['frontend/**','docs/**','artifacts/**']
+  workflow_dispatch:
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo "Build & deploy frontend – ще добавим по-късно"
+
