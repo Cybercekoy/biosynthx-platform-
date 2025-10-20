@@ -9,7 +9,7 @@ from prefect import flow, task
 
 # --- ENV ---
 S3_BUCKET   = os.getenv("S3_BUCKET")
-AWS_REGION  = os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or ""
+raise ValueError("AWS_REGION is empty — set it in GitHub Secrets (e.g., $AWS_REGION)")
 S3_ENDPOINT = os.getenv("S3_ENDPOINT_URL", "")  # optional for non-AWS S3
 TG_TOKEN    = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT     = os.getenv("TELEGRAM_CHAT_ID", "")
