@@ -4,22 +4,26 @@ on:
     - cron: "*/10 * * * *"   
   workflow_dispatch:
 
+permissions:
+  actions: write
+  contents: read
+  
 jobs:
   brain:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with: { fetch-depth: 0 }
 
       - name: Setup Python
         uses: actions/setup-python@v5
-        with: { python-version: '3.11' }
+        with:
+          python-version: '3.11'
 
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install boto3 requests pandas numpy
+          pip install boto3 requests python-telegram-bot==13.* pandas
 
       - name: Run Brain
         env:
@@ -27,9 +31,15 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           AWS_REGION: ${{ secrets.AWS_REGION }}
           S3_BUCKET: ${{ secrets.S3_BUCKET }}
+
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          GH_TOKEN: ${{ secrets.GH_TOKEN }}
-          GH_REPO: ${{ github.repository }}
+
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}           # Personal Access Token (scope: repo)
+          GH_REPO: ${{ github.repository }}           # org/repo
+          PIPELINE_WORKFLOW_FILE: "data-pipeline.yml" # името на pipeline workflow файла
+          BRAIN_MODE: "once"                          # или "loop"
+          BRAIN_CHECK_INTERVAL_SEC: "900"             # при loop = 15 мин
         run: |
-          python -c "import ai_core.brain as b; b.main()"
+          python ai_core/brain.py
+
