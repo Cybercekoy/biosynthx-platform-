@@ -13,8 +13,8 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install boto3 prefect requests
-      - name: Run pipeline
+          pip install pandas numpy boto3 prefect requests reportlab pyarrow
+      - name: Run pipeline v2
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
