@@ -179,7 +179,8 @@ def generate_synthetic_patients(n: int = 50_000, seed: int = 2025) -> pd.DataFra
     next_followup = np.array([lv + datetime.timedelta(days=int(d)) for lv, d in zip(last_visit, rng.integers(30, 240, size=n))])
 
     # Pregnancy flag (only women 18–50; low prevalence)
-    pregnancy = ((sex == "F") & (age.between(18, 50)) & (rng.random(n) < 0.03)).astype(int)
+    pregnancy = ((sex == "F") & (age >= 18) & (age <= 50) & (rng.random(n) < 0.03)).astype(int)
+
 
     # Medications (string list for storage)
     meds = [ ";".join(random_meds(1, np.random.default_rng(int(x)))) for x in rng.integers(0, 2**31 - 1, size=n) ]
