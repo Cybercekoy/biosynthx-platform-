@@ -40,6 +40,14 @@ def ym() -> str:
 def ymd() -> str:
     return datetime.datetime.utcnow().strftime("%Y.%m.%d")
 
+def presign(key, expires=7*24*3600):
+    return s3().generate_presigned_url(
+        ClientMethod="get_object",
+        Params={"Bucket": S3_BUCKET, "Key": key},
+        ExpiresIn=expires
+    )
+     
+
 @dataclass
 class Stats:
     n:int; t1d:int; t2d:int; mean_age:float; female:float
