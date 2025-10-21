@@ -5,50 +5,80 @@ on:
     - cron: '0 2 * * *'   # всеки ден 02:00 UTC
   workflow_dispatch:
 
+# Минимални права за този workflow
+permissions:
+  contents: read
+
+# Не стартирай паралелно две изпълнения на същия ref
+concurrency:
+  group: data-pipeline-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   pipeline:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      TZ: UTC                 # за предвидими време/дати в логовете
+    defaults:
+      run:
+        shell: bash -euxo pipefail
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          fetch-depth: 1
 
-      - name: Set up Python
+      - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: 'pip'
 
-      - name: Install deps
-        run: |
-          python -m pip install --upgrade pip
-          pip install pandas numpy boto3 prefect requests reportlab pyarrow
-
-      - name: Install pandoc (for whitepaper)
+      - name: Install system deps (pandoc for whitepaper)
         run: |
           sudo apt-get update
-          sudo apt-get install -y pandoc
+          sudo apt-get install -y --no-install-recommends pandoc
+          pandoc --version || true
 
-      # по избор: дебъг за проверка, че файлът е на правилното място
-      - name: Debug repo tree
+      - name: Install Python deps
         run: |
-          pwd
-          git branch --show-current
+          python -m pip install --upgrade pip
+          pip install --upgrade \
+            pandas numpy boto3 pyarrow requests reportlab
+
+      - name: Quick debug (env + tree)
+        run: |
+          echo "Ref: $GITHUB_REF  /  SHA: $GITHUB_SHA"
+          echo "Python: $(python --version)"
+          echo "AWS_REGION: ${AWS_REGION}"
+          echo "S3_BUCKET: ${S3_BUCKET}"
           ls -la
           echo "---- find flows ----"
           find . -maxdepth 3 -type f -name "main_flow_v2.py" -print
-          echo "---- list flows dir ----"
-          ls -la flows || true
+        env:
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+          S3_BUCKET: ${{ secrets.S3_BUCKET }}
 
       - name: Run pipeline v2
         env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_REGION: ${{ secrets.AWS_REGION }}
-          S3_BUCKET: ${{ secrets.S3_BUCKET }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          AWS_REGION:            ${{ secrets.AWS_REGION }}
+          S3_BUCKET:             ${{ secrets.S3_BUCKET }}
+          TELEGRAM_BOT_TOKEN:    ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:      ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           python flows/main_flow_v2.py
+
+      # Полезно при диагностика — да се вижда диска/файловете дори при грешка
+      - name: Post-run diagnostics
+        if: always()
+        run: |
+          echo "--- df -h ---"
+          df -h || true
+          echo "--- top-level ls ---"
+          ls -la || true
 
 
