@@ -27,7 +27,8 @@ def get_env(name: str, default: Optional[str] = None) -> str:
     return v
 
 def utc_now():
-    return pd.Timestamp.utcnow().tz_localize("UTC")
+    import pandas as pd
+    return pd.Timestamp.now(tz="UTC")
 
 def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
