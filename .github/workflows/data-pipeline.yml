@@ -2,83 +2,84 @@ name: Nightly Data Pipeline
 
 on:
   schedule:
-    - cron: '0 2 * * *'   # всеки ден 02:00 UTC
+    # всеки ден в 02:00 UTC
+    - cron: '0 2 * * *'
   workflow_dispatch:
 
-# Минимални права за този workflow
+# нужно е за изтегляне на артефакти/логове при нужда
 permissions:
+  actions: write
   contents: read
-
-# Не стартирай паралелно две изпълнения на същия ref
-concurrency:
-  group: data-pipeline-${{ github.ref }}
-  cancel-in-progress: false
 
 jobs:
   pipeline:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-    env:
-      TZ: UTC                 # за предвидими време/дати в логовете
-    defaults:
-      run:
-        shell: bash -euxo pipefail
 
     steps:
+      # 1) Checkout
       - name: Checkout repo
         uses: actions/checkout@v4
         with:
-          fetch-depth: 1
+          fetch-depth: 0
 
+      # 2) Python 3.11 (без requirements auto-install)
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
 
+      # 3) Системни зависимости (pandoc за PDF)
       - name: Install system deps (pandoc for whitepaper)
+        shell: bash
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends pandoc
-          pandoc --version || true
+          sudo apt-get install -y pandoc
 
+      # 4) Python зависимости (инсталираме директно)
       - name: Install Python deps
+        shell: bash
         run: |
           python -m pip install --upgrade pip
-          pip install --upgrade \
-            pandas numpy boto3 pyarrow requests reportlab
+          pip install pandas numpy boto3 prefect requests reportlab pyarrow
 
+      # 5) Бърз дебъг на средата (полезно при проблеми)
       - name: Quick debug (env + tree)
+        shell: bash
         run: |
-          echo "Ref: $GITHUB_REF  /  SHA: $GITHUB_SHA"
-          echo "Python: $(python --version)"
-          echo "AWS_REGION: ${AWS_REGION}"
-          echo "S3_BUCKET: ${S3_BUCKET}"
+          python -V
+          which python
+          pip -V
+          echo "----- env (redacted) -----"
+          env | sed 's/=.*/=<redacted>/' | sort | head -n 50
+          echo "----- repo tree -----"
           ls -la
-          echo "---- find flows ----"
-          find . -maxdepth 3 -type f -name "main_flow_v2.py" -print
+          echo "----- flows dir -----"
+          ls -la flows || true
+          echo "----- locate main_flow_v2.py -----"
+          find . -maxdepth 3 -type f -name "main_flow_v2.py" -print || true
+
+      # 6) Стартираме самия пайплайн
+      - name: Run pipeline v2
+        shell: bash
         env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           AWS_REGION: ${{ secrets.AWS_REGION }}
           S3_BUCKET: ${{ secrets.S3_BUCKET }}
-
-      - name: Run pipeline v2
-        env:
-          AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_REGION:            ${{ secrets.AWS_REGION }}
-          S3_BUCKET:             ${{ secrets.S3_BUCKET }}
-          TELEGRAM_BOT_TOKEN:    ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID:      ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
+          set -euo pipefail
+          test -f flows/main_flow_v2.py || { echo "flows/main_flow_v2.py not found"; exit 1; }
           python flows/main_flow_v2.py
 
-      # Полезно при диагностика — да се вижда диска/файловете дори при грешка
+      # 7) Пост-диагностика (без нестандартни shell опции)
       - name: Post-run diagnostics
+        shell: bash
         if: always()
         run: |
-          echo "--- df -h ---"
-          df -h || true
-          echo "--- top-level ls ---"
-          ls -la || true
-
-
+          echo "--- disk usage ---"
+          df -h
+          echo "--- workspace listing ---"
+          ls -la
