@@ -67,63 +67,87 @@ def upload_file(local_path: str, key: str) -> str:
 # =========================================================
 # Synthetic data generator (50k high-detail)
 # =========================================================
+ import numpy as np
+import pandas as pd
+
 def generate_synthetic_patients(n: int = 50_000, seed: int = 2025) -> pd.DataFrame:
+    """
+    Генерира синтетични пациенти с всички задължителни колони.
+    """
     rng = np.random.default_rng(seed)
 
-    sex = rng.choice(["M", "F"], size=n)
-    age = rng.integers(0, 90, size=n)
+    # Демография
+    age = rng.integers(18, 90, size=n)
+    height_cm = rng.normal(170, 10, size=n).clip(140, 210).round(1)
+    weight_kg = rng.normal(75, 15, size=n).clip(40, 200).round(1)
+    bmi = (weight_kg / ((height_cm / 100) ** 2)).round(1)
 
-    height = rng.normal(170, 10, n).clip(140, 210)
-    weight = rng.normal(70, 15, n).clip(35, 180)
-    bmi = (weight / ((height / 100) ** 2)).round(1)
+    # Витални показатели
+    systolic = rng.normal(122, 14, size=n).clip(90, 210).round(0)
+    diastolic = rng.normal(78, 10, size=n).clip(50, 130).round(0)
+    heart_rate = rng.normal(72, 10, size=n).clip(40, 140).round(0)
 
-    systolic = rng.normal(120, 15, n).clip(90, 200)
-    diastolic = rng.normal(80, 10, n).clip(60, 130)
-    heart_rate = rng.normal(75, 10, n).clip(40, 180)
+    # Метаболитни
+    glucose = rng.normal(5.3, 1.2, size=n).clip(3.0, 25.0).round(1)    # mmol/L
+    insulin = rng.normal(8, 6, size=n).clip(0, 60).round(1)            # μIU/mL
+    dyslipidemia = (rng.random(n) < 0.22).astype(int)
 
-    diabetes_type = rng.choice(["None", "Type1", "Type2"], p=[0.85, 0.05, 0.10], size=n)
-    glucose = rng.normal(90, 15, n).clip(50, 250)
-    insulin = np.where(diabetes_type == "Type1", rng.normal(25, 5, n), rng.normal(10, 3, n))
+    # Навици / начин на живот
+    smoker = (rng.random(n) < 0.23).astype(int)
+    alcohol = (rng.random(n) < 0.35).astype(int)
+    activity = rng.integers(0, 4, size=n)  # 0=ниска, 1=умерена, 2=висока, 3=спорт
 
-    smoker = rng.choice([0, 1], p=[0.7, 0.3], size=n)
-    alcohol = rng.choice(["None", "Low", "Moderate", "High"], p=[0.3, 0.4, 0.25, 0.05], size=n)
-    activity = rng.choice(["Low", "Medium", "High"], p=[0.4, 0.4, 0.2], size=n)
-    sleep_hours = rng.normal(7, 1.5, n).clip(3, 12)
+    sleep_hours = rng.normal(7.0, 1.1, size=n).clip(3.0, 12.0).round(1)
 
-    # Женска бременност 18–50 с малка вероятност – БЕЗ .between()
-    pregnancy = ((sex == "F") & (age >= 18) & (age <= 50) & (rng.random(n) < 0.03)).astype(int)
+    # Рискови/състояния
+    hypertension = (systolic >= 140).astype(int)
+    coronary_hd = ((rng.random(n) < 0.07) | ((age > 55) & (hypertension == 1))).astype(int)
 
-    # Коморбидности (примерни)
-    htn = (systolic >= 140).astype(int)
-    dyslipidemia = (rng.random(n) < 0.2).astype(int)
-    chd = ((htn == 1) & (rng.random(n) < 0.1)).astype(int)
-
-    df = pd.DataFrame(
-        {
-            "patient_id": [f"PAT-{i:05d}" for i in range(n)],
-            "sex": sex,
-            "age": age,
-            "height_cm": height,
-            "weight_kg": weight,
-            "bmi": bmi,
-            "systolic": systolic,
-            "diastolic": diastolic,
-            "heart_rate": heart_rate,
-            "glucose": glucose,
-            "insulin": insulin,
-            "diabetes_type": diabetes_type,
-            "smoker": smoker,
-            "alcohol": alcohol,
-            "activity": activity,
-            "sleep_hours": sleep_hours,
-            "pregnancy": pregnancy,
-            "hypertension": htn,
-            "dyslipidemia": dyslipidemia,
-            "coronary_hd": chd,
-        }
+    # Диабет – вид: 0=няма, 1=тип 1, 2=тип 2 (основно тип 2)
+    p_diab = np.where(age < 30, 0.06, 0.17)
+    has_diabetes = (rng.random(n) < p_diab).astype(int)
+    diabetes_type = np.where(
+        has_diabetes == 0, 0,
+        np.where(rng.random(n) < 0.12, 1, 2)
     )
 
-    df["created_at"] = pd.Timestamp.now()
+    # Бременност (валидно само за част от популацията; моделно допускане)
+    pregnancy = ((rng.random(n) < 0.03) & (age.between(18, 50))).astype(int)
+
+    # Времеви печат
+    created_at = pd.Timestamp.utcnow().isoformat()
+
+    df = pd.DataFrame({
+        "age": age,
+        "height_cm": height_cm,
+        "weight_kg": weight_kg,
+        "bmi": bmi,
+        "systolic": systolic,
+        "diastolic": diastolic,
+        "heart_rate": heart_rate,
+        "glucose": glucose,
+        "insulin": insulin,
+        "diabetes_type": diabetes_type,
+        "smoker": smoker,
+        "alcohol": alcohol,
+        "activity": activity,
+        "sleep_hours": sleep_hours,
+        "pregnancy": pregnancy,
+        "hypertension": hypertension,
+        "dyslipidemia": dyslipidemia,
+        "coronary_hd": coronary_hd,
+        "created_at": created_at,
+    })
+
+    # Подреждаме колоните в точно този ред (както Brain ги очаква)
+    required_order = [
+        "age","height_cm","weight_kg","bmi",
+        "systolic","diastolic","heart_rate","glucose","insulin",
+        "diabetes_type","smoker","alcohol","activity","sleep_hours",
+        "pregnancy","hypertension","dyslipidemia","coronary_hd",
+        "created_at",
+    ]
+    df = df[required_order]
     return df
 
 
