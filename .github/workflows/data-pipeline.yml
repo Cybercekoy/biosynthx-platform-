@@ -2,64 +2,59 @@ name: Nightly Data Pipeline
 
 on:
   schedule:
-    # всеки ден в 02:00 UTC
-    - cron: '0 2 * * *'
+    - cron: '0 2 * * *'     # всеки ден в 02:00 UTC
   workflow_dispatch:
 
-# нужно е за изтегляне на артефакти/логове при нужда
 permissions:
-  actions: write
-  contents: read
+  contents: read             # четене на кода
+  actions: write             # за ръчно рестартиране/анотации (по желание)
 
 jobs:
   pipeline:
     runs-on: ubuntu-latest
 
     steps:
-      # 1) Checkout
+      # 1) Вземи репото
       - name: Checkout repo
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      # 2) Python 3.11 (без requirements auto-install)
+      # 2) Python 3.11
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: 'pip'
 
-      # 3) Системни зависимости (pandoc за PDF)
+      # 3) Системни пакети (pandoc за PDF)
       - name: Install system deps (pandoc for whitepaper)
         shell: bash
         run: |
           sudo apt-get update
           sudo apt-get install -y pandoc
 
-      # 4) Python зависимости (инсталираме директно)
+      # 4) Python зависимости
       - name: Install Python deps
         shell: bash
         run: |
           python -m pip install --upgrade pip
           pip install pandas numpy boto3 prefect requests reportlab pyarrow
 
-      # 5) Бърз дебъг на средата (полезно при проблеми)
+      # 5) Кратък дебъг (по желание)
       - name: Quick debug (env + tree)
         shell: bash
         run: |
-          python -V
-          which python
-          pip -V
-          echo "----- env (redacted) -----"
-          env | sed 's/=.*/=<redacted>/' | sort | head -n 50
-          echo "----- repo tree -----"
+          echo "Python:" $(python --version)
+          echo "Pip:" $(pip --version)
+          echo "Branch:" $(git branch --show-current)
+          echo "Tree level 2:"
           ls -la
-          echo "----- flows dir -----"
+          echo "Flows:"
           ls -la flows || true
-          echo "----- locate main_flow_v2.py -----"
+          echo "Trying to find main_flow_v2.py"
           find . -maxdepth 3 -type f -name "main_flow_v2.py" -print || true
 
-      # 6) Стартираме самия пайплайн
+      # 6) Стартирай pipeline v2
       - name: Run pipeline v2
         shell: bash
         env:
@@ -70,16 +65,18 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          set -euo pipefail
-          test -f flows/main_flow_v2.py || { echo "flows/main_flow_v2.py not found"; exit 1; }
+          set -e
           python flows/main_flow_v2.py
 
-      # 7) Пост-диагностика (без нестандартни shell опции)
+      # 7) Диагностика след изпълнение (по желание)
       - name: Post-run diagnostics
         shell: bash
         if: always()
         run: |
-          echo "--- disk usage ---"
+          echo "Disk usage:"
           df -h
-          echo "--- workspace listing ---"
+          echo "Working dir:"
+          pwd
+          echo "List:"
           ls -la
+
