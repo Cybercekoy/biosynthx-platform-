@@ -1,344 +1,301 @@
+# flows/main_flow_v2.py
+# BioSynthX – Data Pipeline v2
+# Генерира синтетични пациенти (по подразбиране 50 000), записва Parquet и JSONL,
+# билдва whitepaper (Markdown + опционално PDF), качва в S3 и праща Telegram съобщение.
+
+from __future__ import annotations
+
 import os
+import io
 import json
+import math
+import shutil
 import hashlib
 import subprocess
+from dataclasses import dataclass, asdict
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from datetime import datetime, date
-import tempfile
-from typing import Tuple, Dict, Any
+from typing import Dict, Any, Tuple, Optional, List
 
 import numpy as np
 import pandas as pd
 import boto3
-from prefect import flow
-import prefect
+import pyarrow as pa
+import pyarrow.parquet as pq
+import requests
 
 
-# =========================================================
-# JSON-safe encoder: Timestamp / NumPy / NaN → сериализируеми
-# =========================================================
-def json_default(o):
-    if isinstance(o, (np.integer, np.int32, np.int64, pd.Int64Dtype)):
-        return int(o)
-    if isinstance(o, (np.floating, np.float32, np.float64)):
-        # NaN -> None
-        try:
-            if np.isnan(o):
-                return None
-        except Exception:
-            pass
-        return float(o)
-    if isinstance(o, (np.ndarray,)):
-        return o.tolist()
-    if isinstance(o, (pd.Timestamp, np.datetime64, datetime, date)):
-        return pd.Timestamp(o).isoformat()
+# ---------- Конфигурация от средата ----------
+
+AWS_REGION = os.getenv("AWS_REGION", "eu-north-1")
+S3_BUCKET = os.getenv("S3_BUCKET", "")
+TG_BOT = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
+
+UTC = timezone.utc
+TODAY = datetime.now(UTC).date()
+VERSION_DAY = TODAY.strftime("%Y.%m.%d")   # напр. 2025.10.21
+S3_PREFIX = f"artifacts/{VERSION_DAY}"
+LOCAL_DAY_DIR = Path(".artifacts") / VERSION_DAY
+LOCAL_DAY_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# ---------- Утилити ----------
+
+def sha256_str(s: str) -> str:
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+
+def utcnow_iso() -> str:
+    return datetime.now(UTC).isoformat()
+
+
+def ensure_iso(value: Any) -> Any:
+    """Прави Timestamp/датите JSON-сериализируеми."""
+    if isinstance(value, (datetime, pd.Timestamp)):
+        return pd.Timestamp(value).tz_convert(UTC).isoformat() if pd.Timestamp(value).tzinfo else pd.Timestamp(value).tz_localize(UTC).isoformat()
+    return value
+
+
+def json_dumps(obj: Any) -> str:
+    return json.dumps(obj, ensure_ascii=False, default=lambda x: ensure_iso(x))
+
+
+def telegram_notify(text: str) -> None:
+    if not TG_BOT or not TG_CHAT:
+        print("ℹ️ Telegram не е конфигуриран (пропускам).")
+        return
     try:
-        if pd.isna(o):
-            return None
-    except Exception:
-        pass
-    return str(o)
+        resp = requests.post(
+            f"https://api.telegram.org/bot{TG_BOT}/sendMessage",
+            json={"chat_id": TG_CHAT, "text": text, "parse_mode": "Markdown"},
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            print("⚠️ Telegram error:", resp.text)
+    except Exception as e:
+        print("⚠️ Telegram exception:", e)
 
 
-# =========================================================
-# AWS S3 utils
-# =========================================================
+# ---------- S3 ----------
+
 def s3_client():
-    return boto3.client(
-        "s3",
-        aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
-        aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
-        region_name=os.getenv("AWS_REGION"),
-    )
+    return boto3.client("s3", region_name=AWS_REGION)
 
 
-def upload_bytes(key: str, data: bytes, content_type: str = "application/octet-stream") -> str:
-    bucket = os.getenv("S3_BUCKET")
-    s3_client().put_object(Bucket=bucket, Key=key, Body=data, ContentType=content_type)
-    return f"s3://{bucket}/{key}"
+def upload_file(local_path: Path, s3_key: str) -> str:
+    assert S3_BUCKET, "S3_BUCKET е празен!"
+    s3 = s3_client()
+    s3.upload_file(str(local_path), S3_BUCKET, s3_key)
+    return f"s3://{S3_BUCKET}/{s3_key}"
 
 
-def upload_file(local_path: str, key: str) -> str:
-    bucket = os.getenv("S3_BUCKET")
-    s3_client().upload_file(local_path, bucket, key)
-    return f"s3://{bucket}/{key}"
+def upload_bytes(s3_key: str, content: bytes, content_type: str = "application/octet-stream") -> str:
+    assert S3_BUCKET, "S3_BUCKET е празен!"
+    s3 = s3_client()
+    s3.put_object(Bucket=S3_BUCKET, Key=s3_key, Body=content, ContentType=content_type)
+    return f"s3://{S3_BUCKET}/{s3_key}"
 
 
-# =========================================================
-# Synthetic data generator (50k high-detail)
-# =========================================================
- import numpy as np
-import pandas as pd
+# ---------- Генериране на синтетични данни ----------
+
+REQUIRED_COLUMNS = [
+    "activity", "alcohol", "coronary_hd", "created_at", "diabetes_type", "diastolic",
+    "dyslipidemia", "glucose", "heart_rate", "height_cm", "hypertension", "insulin",
+    "pregnancy", "sleep_hours", "smoker", "systolic", "weight_kg",
+]
+
+ALL_COLUMNS = REQUIRED_COLUMNS + [
+    "age", "bmi", "sex"
+]
+
 
 def generate_synthetic_patients(n: int = 50_000, seed: int = 2025) -> pd.DataFrame:
-    """
-    Генерира синтетични пациенти с всички задължителни колони.
-    """
     rng = np.random.default_rng(seed)
 
-    # Демография
+    # Основни демографски
     age = rng.integers(18, 90, size=n)
-    height_cm = rng.normal(170, 10, size=n).clip(140, 210).round(1)
-    weight_kg = rng.normal(75, 15, size=n).clip(40, 200).round(1)
+    sex = rng.choice(["M", "F"], size=n, p=[0.49, 0.51])
+
+    # Антропометрия
+    height_cm = rng.normal(170, 10, size=n).clip(140, 200).round(1)
+    weight_kg = rng.normal(75, 15, size=n).clip(40, 180).round(1)
     bmi = (weight_kg / ((height_cm / 100) ** 2)).round(1)
 
     # Витални показатели
-    systolic = rng.normal(122, 14, size=n).clip(90, 210).round(0)
-    diastolic = rng.normal(78, 10, size=n).clip(50, 130).round(0)
-    heart_rate = rng.normal(72, 10, size=n).clip(40, 140).round(0)
+    systolic = (rng.normal(122, 15, size=n) + (age - 45) * 0.2 + (bmi - 25) * 0.6).round(0).astype(int)
+    diastolic = (rng.normal(78, 10, size=n) + (bmi - 25) * 0.3).round(0).astype(int)
+    heart_rate = rng.normal(72, 8, size=n).clip(45, 140).round(0).astype(int)
 
-    # Метаболитни
-    glucose = rng.normal(5.3, 1.2, size=n).clip(3.0, 25.0).round(1)    # mmol/L
-    insulin = rng.normal(8, 6, size=n).clip(0, 60).round(1)            # μIU/mL
-    dyslipidemia = (rng.random(n) < 0.22).astype(int)
+    # Лайфстайл и състояния
+    smoker = rng.random(n) < 0.26
+    alcohol = rng.integers(0, 15, size=n)  # напитки/седмица
+    activity = rng.integers(0, 7, size=n)  # дни спорт/седмица
+    sleep_hours = rng.normal(7.1, 1.1, size=n).clip(3, 12).round(1)
 
-    # Навици / начин на живот
-    smoker = (rng.random(n) < 0.23).astype(int)
-    alcohol = (rng.random(n) < 0.35).astype(int)
-    activity = rng.integers(0, 4, size=n)  # 0=ниска, 1=умерена, 2=висока, 3=спорт
+    # Метаболитни показатели
+    insulin = rng.normal(12, 6, size=n).clip(2, 60).round(1)
+    glucose = (rng.normal(5.2, 0.7, size=n) + (bmi - 25) * 0.02 + smoker * 0.1).round(2)
 
-    sleep_hours = rng.normal(7.0, 1.1, size=n).clip(3.0, 12.0).round(1)
-
-    # Рискови/състояния
-    hypertension = (systolic >= 140).astype(int)
-    coronary_hd = ((rng.random(n) < 0.07) | ((age > 55) & (hypertension == 1))).astype(int)
-
-    # Диабет – вид: 0=няма, 1=тип 1, 2=тип 2 (основно тип 2)
-    p_diab = np.where(age < 30, 0.06, 0.17)
-    has_diabetes = (rng.random(n) < p_diab).astype(int)
+    # Диагнози (зависими от рискови фактори)
+    hypertension = (systolic >= 140) | (diastolic >= 90)
+    dyslipidemia = (bmi >= 28) | (rng.random(n) < 0.12)
     diabetes_type = np.where(
-        has_diabetes == 0, 0,
-        np.where(rng.random(n) < 0.12, 1, 2)
+        glucose >= 7.0,
+        np.where(rng.random(n) < 0.85, "T2D", "T1D"),
+        "none",
     )
+    # Коронарна болест риск
+    base_chd = 0.04 + (age - 40) * 0.002 + (bmi - 25) * 0.003 + smoker * 0.05 + hypertension * 0.05 + (diabetes_type != "none") * 0.08
+    coronary_hd = rng.random(n) < np.clip(base_chd, 0, 0.9)
 
-    # Бременност (валидно само за част от популацията; моделно допускане)
-    pregnancy = ((rng.random(n) < 0.03) & (age.between(18, 50))).astype(int)
+    # Бременност – само при жени и възраст 18-50
+    can_preg = (sex == "F") & (age >= 18) & (age <= 50)
+    pregnancy = (rng.random(n) < 0.03) & can_preg
 
-    # Времеви печат
-    created_at = pd.Timestamp.utcnow().isoformat()
+    # Време на създаване
+    created_at = pd.to_datetime(datetime.now(UTC))  # tz-aware
 
     df = pd.DataFrame({
         "age": age,
+        "sex": sex,
         "height_cm": height_cm,
         "weight_kg": weight_kg,
-        "bmi": bmi,
+        "bmi": bmi.round(1),
         "systolic": systolic,
         "diastolic": diastolic,
         "heart_rate": heart_rate,
-        "glucose": glucose,
-        "insulin": insulin,
-        "diabetes_type": diabetes_type,
-        "smoker": smoker,
-        "alcohol": alcohol,
-        "activity": activity,
+        "smoker": smoker.astype(bool),
+        "alcohol": alcohol.astype(int),
+        "activity": activity.astype(int),
         "sleep_hours": sleep_hours,
-        "pregnancy": pregnancy,
-        "hypertension": hypertension,
-        "dyslipidemia": dyslipidemia,
-        "coronary_hd": coronary_hd,
+        "insulin": insulin,
+        "glucose": glucose,
+        "hypertension": hypertension.astype(bool),
+        "dyslipidemia": dyslipidemia.astype(bool),
+        "diabetes_type": diabetes_type,
+        "coronary_hd": coronary_hd.astype(bool),
+        "pregnancy": pregnancy.astype(bool),
         "created_at": created_at,
     })
 
-    # Подреждаме колоните в точно този ред (както Brain ги очаква)
-    required_order = [
-        "age","height_cm","weight_kg","bmi",
-        "systolic","diastolic","heart_rate","glucose","insulin",
-        "diabetes_type","smoker","alcohol","activity","sleep_hours",
-        "pregnancy","hypertension","dyslipidemia","coronary_hd",
-        "created_at",
-    ]
-    df = df[required_order]
+    # Колоните в стабилен ред
+    df = df[ALL_COLUMNS]
     return df
 
 
-# =========================================================
-# Stats & manifest
-# =========================================================
+# ---------- Статистики и качество ----------
+
+@dataclass
+class DataQuality:
+    generated_rows: int
+    required_columns_ok: bool
+    missing_required: List[str]
+    min_rows_ok: bool
+    min_rows_threshold: int
+    recency_ok: bool
+    recency_hint: str
+
+    def summary_mark(self) -> str:
+        ok = self.required_columns_ok and self.min_rows_ok and self.recency_ok
+        return "PASS" if ok else "FAIL"
+
+
 def compute_stats(df: pd.DataFrame) -> Dict[str, Any]:
     stats = {
-        "count": int(len(df)),
-        "by_sex": df["sex"].value_counts(dropna=False).to_dict(),
-        "age": {
-            "min": float(df["age"].min()),
-            "max": float(df["age"].max()),
-            "mean": float(df["age"].mean()),
-        },
-        "bmi": {
-            "min": float(df["bmi"].min()),
-            "max": float(df["bmi"].max()),
-            "mean": float(df["bmi"].mean()),
-        },
+        "rows": int(len(df)),
+        "cols": int(df.shape[1]),
+        "created_at_min": df["created_at"].min(),
+        "created_at_max": df["created_at"].max(),
+        "age_mean": float(df["age"].mean()),
+        "bmi_mean": float(df["bmi"].mean()),
+        "systolic_mean": float(df["systolic"].mean()),
+        "diastolic_mean": float(df["diastolic"].mean()),
         "hypertension_rate": float(df["hypertension"].mean()),
-        "diabetes_type": df["diabetes_type"].value_counts(dropna=False).to_dict(),
+        "diabetes_rate": float((df["diabetes_type"] != "none").mean()),
         "smoker_rate": float(df["smoker"].mean()),
+        "chd_rate": float(df["coronary_hd"].mean()),
     }
     return stats
 
 
-# =========================================================
-# Writers
-# =========================================================
-def write_jsonl(df: pd.DataFrame, path: Path):
-    with open(path, "w", encoding="utf-8") as f:
-        for rec in df.to_dict(orient="records"):
-            f.write(json.dumps(rec, ensure_ascii=False, default=json_default) + "\n")
+def check_quality(df: pd.DataFrame, min_rows: int = 50_000, recency_days: int = 1) -> DataQuality:
+    missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
+    required_ok = len(missing) == 0
+    min_ok = len(df) >= min_rows
+
+    if "created_at" in df.columns and len(df):
+        latest = pd.Timestamp(df["created_at"].max()).tz_convert(UTC) if pd.Timestamp(df["created_at"].max()).tzinfo else pd.Timestamp(df["created_at"].max()).tz_localize(UTC)
+        cutoff = pd.Timestamp(datetime.now(UTC) - timedelta(days=recency_days))
+        recency_ok = latest >= cutoff
+        recency_hint = f"latest={latest.isoformat()} cutoff={cutoff.isoformat()}"
+    else:
+        recency_ok = False
+        recency_hint = "missing created_at"
+
+    return DataQuality(
+        generated_rows=int(len(df)),
+        required_columns_ok=required_ok,
+        missing_required=missing,
+        min_rows_ok=min_ok,
+        min_rows_threshold=min_rows,
+        recency_ok=recency_ok,
+        recency_hint=recency_hint,
+    )
 
 
-def write_parquet(df: pd.DataFrame, path: Path):
-    # pyarrow е инсталиран в Actions
-    df.to_parquet(path, index=False)
+# ---------- Запис локално ----------
+
+def save_parquet_jsonl(df: pd.DataFrame, base_dir: Path) -> Tuple[Path, Path]:
+    pq_path = base_dir / "patients.parquet"
+    js_path = base_dir / "patients.jsonl"
+
+    # Parquet
+    table = pa.Table.from_pandas(df)
+    pq.write_table(table, pq_path, compression="snappy")
+
+    # JSONL (Timestamp → ISO)
+    with js_path.open("w", encoding="utf-8") as f:
+        for _, row in df.iterrows():
+            obj = {k: ensure_iso(v) for k, v in row.to_dict().items()}
+            f.write(json_dumps(obj) + "\n")
+
+    return pq_path, js_path
 
 
-# =========================================================
-# Whitepaper (Markdown + опционално PDF през pandoc)
-# =========================================================
-def build_whitepaper_md(stats: Dict[str, Any], manifest: Dict[str, Any]) -> str:
-    lines = [
-        "# BioSynthX Synthetic Cohort — Nightly Whitepaper",
-        "",
-        f"**Generated at:** {manifest['generated_at']}",
-        f"**Records:** {manifest['records']}",
-        "",
-        "## Demographics",
-        f"- Sex distribution: `{stats['by_sex']}`",
-        f"- Age: min `{stats['age']['min']}`, mean `{stats['age']['mean']:.2f}`, max `{stats['age']['max']}`",
-        "",
-        "## Clinical",
-        f"- BMI: min `{stats['bmi']['min']:.1f}`, mean `{stats['bmi']['mean']:.2f}`, max `{stats['bmi']['max']:.1f}`",
-        f"- Hypertension rate: `{stats['hypertension_rate']:.3f}`",
-        f"- Diabetes types: `{stats['diabetes_type']}`",
-        f"- Smokers: `{stats['smoker_rate']:.3f}`",
-        "",
-        "## Artifacts",
-        f"- S3 prefix: `{manifest['s3_prefix']}`",
-    ]
-    return "\n".join(lines) + "\n"
+# ---------- Whitepaper (Markdown + опц. PDF чрез pandoc) ----------
 
-
-def try_pandoc_to_pdf(md_path: Path, pdf_path: Path) -> bool:
+def have_pandoc() -> bool:
     try:
-        subprocess.run(
-            ["pandoc", str(md_path), "-o", str(pdf_path)],
-            check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
+        subprocess.run(["pandoc", "-v"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
         return True
     except Exception:
         return False
 
 
-# =========================================================
-# Telegram helper (optional)
-# =========================================================
-def notify_telegram(message: str):
-    token = os.getenv("TELEGRAM_BOT_TOKEN", "")
-    chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
-    if not token or not chat_id:
-        return
-    try:
-        import requests
+def build_whitepaper(stats: Dict[str, Any], manifest: Dict[str, Any], base_dir: Path) -> Tuple[Path, Optional[Path]]:
+    md = base_dir / "whitepaper.md"
+    pdf = base_dir / "whitepaper.pdf"
 
-        url = f"https://api.telegram.org/bot{token}/sendMessage"
-        requests.post(url, json={"chat_id": chat_id, "text": message[:4000]})
-    except Exception:
-        pass
+    md.write_text(
+        f"""# BioSynthX Артефакти – {VERSION_DAY}
 
+Дата/час на билд: **{utcnow_iso()}**
 
-# =========================================================
-# Main Flow
-# =========================================================
-@flow(name="BioSynthX Nightly Pipeline v2 (full)")
-def main():
-    log = prefect.get_run_logger()
-    n = int(os.getenv("BSX_N_PATIENTS", "50000"))
-    seed = int(os.getenv("BSX_SEED", "2025"))
+## Резюме
 
-    log.info(f"🚀 Generating synthetic cohort: n={n}, seed={seed}")
-    df = generate_synthetic_patients(n=n, seed=seed)
-    stats = compute_stats(df)
+- Редове: **{stats['rows']:,}**
+- Колони: **{stats['cols']}**
+- Средна възраст: **{stats['age_mean']:.1f}**
+- Среден BMI: **{stats['bmi_mean']:.1f}**
+- Хипертония (дял): **{stats['hypertension_rate']:.2%}**
+- Диабет (дял): **{stats['diabetes_rate']:.2%}**
+- Пушачи (дял): **{stats['smoker_rate']:.2%}**
+- Коронарна болест (дял): **{stats['chd_rate']:.2%}**
 
-    day = datetime.now().strftime("%Y.%m.%d")
-    prefix = f"artifacts/{day}"
-    tmp = Path(tempfile.mkdtemp())
+## Manifest
 
-    # ---- write artifacts locally
-    jsonl_path = tmp / f"patients_{day}.jsonl"
-    parquet_path = tmp / f"patients_{day}.parquet"
-    manifest_path = tmp / f"manifest_{day}.json"
-    md_path = tmp / f"whitepaper_{day}.md"
-    pdf_path = tmp / f"whitepaper_{day}.pdf"
+```json
+{json_dumps(manifest)}
 
-    # JSONL / Parquet
-    write_jsonl(df, jsonl_path)
-    write_parquet(df, parquet_path)
-
-    # Manifest
-    manifest = {
-        "generated_at": datetime.now().isoformat(),
-        "records": int(len(df)),
-        "columns": df.columns.tolist(),
-        "s3_prefix": prefix,
-        "hash": sha256_file(jsonl_path),
-    }
-    with open(manifest_path, "w", encoding="utf-8") as f:
-        json.dump(manifest, f, ensure_ascii=False, indent=2, default=json_default)
-
-    # Whitepaper MD (+ optional PDF)
-    md_text = build_whitepaper_md(stats, manifest)
-    md_path.write_text(md_text, encoding="utf-8")
-
-    has_pdf = try_pandoc_to_pdf(md_path, pdf_path)
-
-    # ---- upload to S3
-    log.info("☁️ Uploading artifacts to S3…")
-    parquet_key = f"{prefix}/patients.parquet"
-    jsonl_key = f"{prefix}/patients.jsonl"
-    man_key = f"{prefix}/manifest.json"
-    wp_md_key = f"{prefix}/whitepaper.md"
-    wp_pdf_key = f"{prefix}/whitepaper.pdf"
-
-    parquet_uri = upload_file(str(parquet_path), parquet_key)
-    jsonl_uri = upload_file(str(jsonl_path), jsonl_key)
-    man_uri = upload_file(str(manifest_path), man_key)
-    wp_md_uri = upload_file(str(md_path), wp_md_key)
-
-    wp_pdf_uri = ""
-    if has_pdf and pdf_path.exists():
-        wp_pdf_uri = upload_file(str(pdf_path), wp_pdf_key)
-
-    # changelog append (one JSON per day)
-    changelog_key = f"changelog/{day}.json"
-    change = {
-        "date": datetime.now().isoformat(),
-        "records": int(len(df)),
-        "parquet": parquet_uri,
-        "jsonl": jsonl_uri,
-        "manifest": man_uri,
-        "whitepaper_md": wp_md_uri,
-        "whitepaper_pdf": wp_pdf_uri,
-    }
-    upload_bytes(changelog_key, (json.dumps(change, ensure_ascii=False, default=json_default) + "\n").encode("utf-8"),
-                 "application/json")
-
-    # Telegram (optional)
-    notify_telegram(
-        "✅ BioSynthX v2 OK\n"
-        f"{jsonl_uri}\nmanifest: {man_uri}\nsha256: {manifest['hash']}\n"
-        f"MD: {wp_md_uri}\nPDF: {wp_pdf_uri or '(none)'}"
-    )
-
-    log.info("🎉 Done v2 (full).")
-
-
-def sha256_file(path: Path) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-
-if __name__ == "__main__":
-    main()
 
