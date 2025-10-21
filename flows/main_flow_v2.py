@@ -115,7 +115,7 @@ def generate_synthetic_patients(n: int = 50_000, seed: int = 2025) -> pd.DataFra
     # pregnancy: само F, възраст 18-50 и ~3% шанс
     pregnancy = ((sex == "F") & (age >= 18) & (age <= 50) & (rng.random(n) < 0.03)).astype(int)
 
-    created_at = pd.to_datetime(pd.Timestamp.utcnow()).tz_localize("UTC")
+    created_at = pd.Timestamp.now(tr="UTC")
 
     df = pd.DataFrame({
         "age": age.astype(int),
